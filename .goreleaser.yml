@@ -1,7 +1,7 @@
 env:
   - GO111MODULE=on
   - CGO_ENABLED=0
-  - GITHUB_ORG=UstyuzhaninAV
+  - GITHUB_ORG=ustyuzhaninav
   - DOCKER_ORG=ustiuzhanin
 
 before:
