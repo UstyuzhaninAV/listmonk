@@ -31,9 +31,6 @@ import (
 )
 
 const (
-	// stdInputMaxLen is the maximum allowed length for a standard input field.
-	stdInputMaxLen = 200
-
 	// commitBatchSize is the number of inserts to commit in a single SQL transaction.
 	commitBatchSize = 10000
 )
@@ -52,11 +49,17 @@ const (
 
 // Importer represents the bulk CSV subscriber import system.
 type Importer struct {
-	opt                   Options
-	db                    *sql.DB
-	i18n                  *i18n.I18n
-	domainBlocklist       map[string]bool
+	opt  Options
+	db   *sql.DB
+	i18n *i18n.I18n
+
+	domainBlocklist       map[string]struct{}
 	hasBlocklistWildcards bool
+	hasBlocklist          bool
+
+	domainAllowlist       map[string]struct{}
+	hasAllowlistWildcards bool
+	hasAllowlist          bool
 
 	stop   chan bool
 	status Status
@@ -68,10 +71,10 @@ type Options struct {
 	UpsertStmt         *sql.Stmt
 	BlocklistStmt      *sql.Stmt
 	UpdateListDateStmt *sql.Stmt
-	NotifCB            models.AdminNotifCallback
+	PostCB             func(subject string, data any) error
 
-	// Lookup table for blocklisted domains.
 	DomainBlocklist []string
+	DomainAllowlist []string
 }
 
 // Session represents a single import session.
@@ -136,23 +139,23 @@ func New(opt Options, db *sql.DB, i *i18n.I18n) *Importer {
 		opt:             opt,
 		db:              db,
 		i18n:            i,
-		domainBlocklist: make(map[string]bool, len(opt.DomainBlocklist)),
+		domainBlocklist: make(map[string]struct{}, len(opt.DomainBlocklist)),
+		domainAllowlist: make(map[string]struct{}, len(opt.DomainAllowlist)),
 		status:          Status{Status: StatusNone, logBuf: bytes.NewBuffer(nil)},
 		stop:            make(chan bool, 1),
 	}
 
 	// Domain blocklist.
-	for _, d := range opt.DomainBlocklist {
-		im.domainBlocklist[d] = true
+	mp, hasWildcards := makeDomainMap(opt.DomainBlocklist)
+	im.domainBlocklist = mp
+	im.hasBlocklistWildcards = hasWildcards
+	im.hasBlocklist = len(mp) > 0
 
-		// Domains with *. as the subdomain prefix, strip that
-		// and add the full domain to the blocklist as well.
-		// eg: *.example.com => example.com
-		if strings.Contains(d, "*.") {
-			im.hasBlocklistWildcards = true
-			im.domainBlocklist[strings.TrimPrefix(d, "*.")] = true
-		}
-	}
+	// Domain allowlist.
+	mp, hasWildcards = makeDomainMap(opt.DomainAllowlist)
+	im.domainAllowlist = mp
+	im.hasAllowlistWildcards = hasWildcards
+	im.hasAllowlist = len(mp) > 0
 
 	return &im
 }
@@ -172,7 +175,7 @@ func (im *Importer) NewSession(opt SessionOpt) (*Session, error) {
 
 	s := &Session{
 		im:       im,
-		log:      log.New(im.status.logBuf, "", log.Ldate|log.Ltime|log.Lshortfile),
+		log:      log.New(im.status.logBuf, "", log.Ldate|log.Ltime|log.Lmicroseconds|log.Lshortfile),
 		subQueue: make(chan SubReq, commitBatchSize),
 		opt:      opt,
 	}
@@ -185,6 +188,7 @@ func (im *Importer) NewSession(opt SessionOpt) (*Session, error) {
 func (im *Importer) GetStats() Status {
 	im.RLock()
 	defer im.RUnlock()
+
 	return Status{
 		Name:     im.status.Name,
 		Status:   im.status.Status,
@@ -201,6 +205,7 @@ func (im *Importer) GetLogs() []byte {
 	if im.status.logBuf == nil {
 		return []byte{}
 	}
+
 	return im.status.logBuf.Bytes()
 }
 
@@ -227,6 +232,7 @@ func (im *Importer) isDone() bool {
 		s = false
 	}
 	im.RUnlock()
+
 	return s
 }
 
@@ -247,11 +253,9 @@ func (im *Importer) sendNotif(status string) error {
 			Imported: s.Imported,
 			Total:    s.Total,
 		}
-		subject = fmt.Sprintf("%s: %s import",
-			cases.Title(language.Und).String(status),
-			s.Name)
+		subject = fmt.Sprintf("%s: %s import", cases.Title(language.Und).String(status), s.Name)
 	)
-	return im.opt.NotifCB(subject, out)
+	return im.opt.PostCB(subject, out)
 }
 
 // Start is a blocking function that selects on a channel queue until all
@@ -264,13 +268,10 @@ func (s *Session) Start() {
 		err   error
 		total = 0
 		cur   = 0
-
-		listIDs = make([]int, len(s.opt.ListIDs))
 	)
 
-	for i, v := range s.opt.ListIDs {
-		listIDs[i] = v
-	}
+	listIDs := make([]int, len(s.opt.ListIDs))
+	copy(listIDs, s.opt.ListIDs)
 
 	for sub := range s.subQueue {
 		if cur == 0 {
@@ -348,6 +349,7 @@ func (s *Session) Start() {
 	if _, err := s.im.opt.UpdateListDateStmt.Exec(pq.Array(listIDs)); err != nil {
 		s.log.Printf("error updating lists date: %v", err)
 	}
+
 	s.im.sendNotif(StatusFinished)
 }
 
@@ -470,8 +472,8 @@ func (s *Session) LoadCSV(srcPath string, delim rune) error {
 		return errors.New("empty file")
 	}
 
-	s.im.Lock()
 	// Exclude the header from count.
+	s.im.Lock()
 	s.im.status.Total = numLines - 1
 	s.im.Unlock()
 
@@ -569,6 +571,7 @@ func (s *Session) LoadCSV(srcPath string, delim rune) error {
 
 	close(s.subQueue)
 	failed = false
+
 	return nil
 }
 
@@ -578,6 +581,7 @@ func (im *Importer) Stop() {
 		im.Lock()
 		im.status = Status{Status: StatusNone}
 		im.Unlock()
+
 		return
 	}
 
@@ -603,29 +607,24 @@ func (im *Importer) SanitizeEmail(email string) (string, error) {
 
 	// Check if the e-mail's domain is blocklisted. The e-mail domain and blocklist config
 	// are always lowercase.
-	d := strings.Split(em.Address, "@")
-	if len(d) == 2 {
-		domain := d[1]
-
-		// Check the domain as-is.
-		if _, ok := im.domainBlocklist[domain]; ok {
-			return "", errors.New(im.i18n.T("subscribers.domainBlocklisted"))
+	if im.hasAllowlist || im.hasBlocklist {
+		d := strings.Split(em.Address, "@")
+		if len(d) != 2 {
+			return em.Address, nil
 		}
 
-		// If there are wildcards in the blocklist and the email domain has a subdomain, check that.
-		if im.hasBlocklistWildcards && strings.Count(domain, ".") > 1 {
-			parts := strings.Split(domain, ".")
+		domain := d[1]
 
-			// Replace the first part of the subdomain with * and check if that exists in the blocklist.
-			// Eg: test.mail.example.com => *.mail.example.com
-			parts[0] = "*"
-			domain = strings.Join(parts, ".")
-
-			if _, ok := im.domainBlocklist[domain]; ok {
+		// If there's an allowlist, check if the domain is in it. Checking blocklist after that is moot.
+		if im.hasAllowlist {
+			if !im.checkInList(domain, im.hasAllowlistWildcards, im.domainAllowlist) {
+				return "", errors.New(im.i18n.T("subscribers.domainBlocklisted"))
+			}
+		} else if im.hasBlocklist {
+			if im.checkInList(domain, im.hasBlocklistWildcards, im.domainBlocklist) {
 				return "", errors.New(im.i18n.T("subscribers.domainBlocklisted"))
 			}
 		}
-
 	}
 
 	return em.Address, nil
@@ -657,6 +656,30 @@ func (im *Importer) ValidateFields(s SubReq) (SubReq, error) {
 	}
 
 	return s, nil
+}
+
+// Check the domain against the given map of domains (block/allowlist).
+func (im *Importer) checkInList(domain string, hasWildcards bool, mp map[string]struct{}) bool {
+	// Check the domain as-is.
+	if _, ok := mp[domain]; ok {
+		return true
+	}
+
+	// If there are wildcards in the list and the email domain has a subdomain, check that.
+	if hasWildcards && strings.Count(domain, ".") > 1 {
+		parts := strings.Split(domain, ".")
+
+		// Replace the first part of the subdomain with * and check if that exists in the list.
+		// Eg: test.mail.example.com => *.mail.example.com
+		parts[0] = "*"
+		domain = strings.Join(parts, ".")
+
+		if _, ok := mp[domain]; ok {
+			return true
+		}
+	}
+
+	return false
 }
 
 // mapCSVHeaders takes a list of headers obtained from a CSV file, a map of known headers,
@@ -701,4 +724,24 @@ func countLines(r io.Reader) (int, error) {
 			return count, err
 		}
 	}
+}
+
+func makeDomainMap(domains []string) (map[string]struct{}, bool) {
+	var (
+		out          = make(map[string]struct{}, len(domains))
+		hasWildCards = false
+	)
+	for _, d := range domains {
+		out[d] = struct{}{}
+
+		// Domains with *. as the subdomain prefix, strip that
+		// and add the full domain to the blocklist as well.
+		// eg: *.example.com => example.com
+		if strings.Contains(d, "*.") {
+			hasWildCards = true
+			out[strings.TrimPrefix(d, "*.")] = struct{}{}
+		}
+	}
+
+	return out, hasWildCards
 }

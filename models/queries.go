@@ -53,6 +53,7 @@ type Queries struct {
 	QueryLists      string     `query:"query-lists"`
 	GetLists        *sqlx.Stmt `query:"get-lists"`
 	GetListsByOptin *sqlx.Stmt `query:"get-lists-by-optin"`
+	GetListTypes    *sqlx.Stmt `query:"get-list-types"`
 	UpdateList      *sqlx.Stmt `query:"update-list"`
 	UpdateListsDate *sqlx.Stmt `query:"update-lists-date"`
 	DeleteLists     *sqlx.Stmt `query:"delete-lists"`
@@ -64,6 +65,7 @@ type Queries struct {
 	GetCampaignStats      *sqlx.Stmt `query:"get-campaign-stats"`
 	GetCampaignStatus     *sqlx.Stmt `query:"get-campaign-status"`
 	GetArchivedCampaigns  *sqlx.Stmt `query:"get-archived-campaigns"`
+	CampaignHasLists      *sqlx.Stmt `query:"campaign-has-lists"`
 
 	// These two queries are read as strings and based on settings.individual_tracking=on/off,
 	// are interpolated and copied to view and click counts. Same query, different tables.
@@ -155,7 +157,7 @@ func (q *Queries) CompileSubscriberQueryTpl(exp string, db *sqlx.DB, subStatus s
 // compileSubscriberQueryTpl takes an arbitrary WHERE expressions and a subscriber
 // query template that depends on the filter (eg: delete by query, blocklist by query etc.)
 // combines and executes them.
-func (q *Queries) ExecSubQueryTpl(exp, tpl string, listIDs []int, db *sqlx.DB, subStatus string, args ...interface{}) error {
+func (q *Queries) ExecSubQueryTpl(exp, tpl string, listIDs []int, db *sqlx.DB, subStatus string, args ...any) error {
 	// Perform a dry run.
 	filterExp, err := q.CompileSubscriberQueryTpl(exp, db, subStatus)
 	if err != nil {
@@ -167,7 +169,7 @@ func (q *Queries) ExecSubQueryTpl(exp, tpl string, listIDs []int, db *sqlx.DB, s
 	}
 
 	// First argument is the boolean indicating if the query is a dry run.
-	a := append([]interface{}{false, pq.Array(listIDs), subStatus}, args...)
+	a := append([]any{false, pq.Array(listIDs), subStatus}, args...)
 	if _, err := db.Exec(fmt.Sprintf(tpl, filterExp), a...); err != nil {
 		return err
 	}
